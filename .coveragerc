@@ -1,0 +1,19 @@
+[run]
+branch = True
+dynamic_context = test_function
+
+[report]
+# Regexes for lines to exclude from consideration
+exclude_lines =
+    # Have to re-enable the standard pragma
+    pragma: no cover
+
+    # Don't complain if non-runnable code isn't run
+    if __name__ == .__main__.:
+
+    # exclude typing.TYPE_CHECKING
+    if TYPE_CHECKING:
+    if t.TYPE_CHECKING:
+
+[html]
+show_contexts = True
