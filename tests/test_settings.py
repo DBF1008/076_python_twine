@@ -14,10 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import getpass
 import logging
 
 import pytest
 
+from twine import auth
 from twine import exceptions
 from twine import repository
 from twine import settings
@@ -198,3 +200,50 @@ class TestArgumentParsing:
     def test_attestations_flag(self):
         args = self.parse_args(["--attestations"])
         assert args.attestations
+
+
+# --- Client certificate (mTLS) + non-interactive regression tests ---
+
+
+def test_no_username_prompt_if_client_cert_and_non_interactive():
+    """Non-interactive with client cert on non-PyPI repo: no error for username."""
+    settings_obj = settings.Settings(
+        client_cert="/random/path",
+        non_interactive=True,
+        repository_url="https://private.example.com/simple/",
+    )
+    assert settings_obj.username is None
+
+
+def test_client_cert_non_interactive_both_credentials_none():
+    """Both username and password should be None with cert-only non-interactive."""
+    settings_obj = settings.Settings(
+        client_cert="/random/path",
+        non_interactive=True,
+        repository_url="https://private.example.com/simple/",
+    )
+    assert settings_obj.username is None
+    assert settings_obj.password is None
+
+
+def test_client_cert_interactive_skips_credential_prompt(monkeypatch):
+    """Interactive mode with client cert on non-PyPI repo should not prompt."""
+    monkeypatch.setattr(
+        auth, "input", lambda prompt: pytest.fail("should not prompt"), raising=False
+    )
+    monkeypatch.setattr(
+        getpass, "getpass", lambda prompt: pytest.fail("should not prompt")
+    )
+
+    settings_obj = settings.Settings(
+        client_cert="/random/path",
+        repository_url="https://private.example.com/simple/",
+    )
+    assert settings_obj.username is None
+    assert settings_obj.password is None
+
+
+def test_pypi_client_cert_still_uses_token():
+    """PyPI with client cert should still default username to __token__."""
+    settings_obj = settings.Settings(client_cert="/random/path")
+    assert settings_obj.username == "__token__"

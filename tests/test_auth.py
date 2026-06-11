@@ -454,3 +454,72 @@ def test_inability_to_make_token_raises_error():
     )
     with pytest.raises(exceptions.TrustedPublishingFailure):
         authenticator(None)
+
+
+# --- Client certificate (mTLS) authentication tests ---
+
+
+def test_allows_cert_auth_true_for_non_pypi_with_cert(config):
+    """allows_cert_auth returns True for non-PyPI repo with client cert."""
+    res = auth.Resolver(config, auth.CredentialInput(client_cert="/path/cert.pem"))
+    assert res.allows_cert_auth() is True
+
+
+def test_allows_cert_auth_false_for_pypi_with_cert():
+    """allows_cert_auth returns False for PyPI even with client cert."""
+    pypi_config = dict(repository=utils.DEFAULT_REPOSITORY)
+    res = auth.Resolver(
+        pypi_config, auth.CredentialInput(client_cert="/path/cert.pem")
+    )
+    assert res.allows_cert_auth() is False
+
+
+def test_allows_cert_auth_false_without_cert(config):
+    """allows_cert_auth returns False without client cert."""
+    res = auth.Resolver(config, auth.CredentialInput())
+    assert res.allows_cert_auth() is False
+
+
+def test_cert_auth_skips_username_prompt(monkeypatch, config):
+    """Non-PyPI repo with client cert should not prompt for username."""
+    monkeypatch.setattr(
+        auth, "input", lambda prompt: pytest.fail("should not prompt"), raising=False
+    )
+    res = auth.Resolver(config, auth.CredentialInput(client_cert="/path/cert.pem"))
+    assert res.username is None
+
+
+def test_cert_auth_skips_password_prompt(monkeypatch, config):
+    """Non-PyPI repo with client cert should not prompt for password."""
+    monkeypatch.setattr(
+        getpass, "getpass", lambda prompt: pytest.fail("should not prompt")
+    )
+    res = auth.Resolver(config, auth.CredentialInput(client_cert="/path/cert.pem"))
+    assert res.password is None
+
+
+def test_cert_auth_non_interactive_no_username_error(config):
+    """Private resolver with client cert should not raise NonInteractive for username."""
+    res = auth.Private(config, auth.CredentialInput(client_cert="/path/cert.pem"))
+    assert res.username is None
+
+
+def test_cert_auth_non_interactive_no_password_error(config):
+    """Private resolver with client cert should not raise NonInteractive for password."""
+    res = auth.Private(config, auth.CredentialInput(client_cert="/path/cert.pem"))
+    assert res.password is None
+
+
+def test_pypi_cert_still_defaults_to_token_username():
+    """PyPI with client cert still defaults username to __token__."""
+    pypi_config = dict(repository=utils.DEFAULT_REPOSITORY)
+    res = auth.Resolver(
+        pypi_config, auth.CredentialInput(client_cert="/path/cert.pem")
+    )
+    assert res.username == auth.TOKEN_USERNAME
+
+
+def test_authenticator_returns_none_for_cert_only(config):
+    """authenticator returns None when only client cert is available."""
+    res = auth.Resolver(config, auth.CredentialInput(client_cert="/path/cert.pem"))
+    assert res.authenticator is None

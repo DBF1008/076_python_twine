@@ -43,10 +43,14 @@ TOKEN_RENEWAL_THRESHOLD: t.Final[datetime.timedelta] = datetime.timedelta(
 
 class CredentialInput:
     def __init__(
-        self, username: t.Optional[str] = None, password: t.Optional[str] = None
+        self,
+        username: t.Optional[str] = None,
+        password: t.Optional[str] = None,
+        client_cert: t.Optional[str] = None,
     ) -> None:
         self.username = username
         self.password = password
+        self.client_cert = client_cert
 
 
 class TrustedPublishingTokenRetrievalError(t.TypedDict):
@@ -102,7 +106,7 @@ class Resolver:
 
     @property
     @functools.lru_cache()
-    def authenticator(self) -> "requests.auth.AuthBase":
+    def authenticator(self) -> t.Optional["requests.auth.AuthBase"]:
         username = self.username
         password = self.password
         if self._tp_token:
@@ -117,6 +121,9 @@ class Resolver:
                 username=username,
                 password=password,
             )
+        if self.allows_cert_auth():
+            # Client certificate (mTLS) is sufficient; no HTTP-level auth needed.
+            return None
         raise exceptions.InvalidConfiguration(
             "could not determine credentials for configured repository"
         )
@@ -124,6 +131,14 @@ class Resolver:
     @classmethod
     def choose(cls, interactive: bool) -> t.Type["Resolver"]:
         return cls if interactive else Private
+
+    def allows_cert_auth(self) -> bool:
+        """Whether client certificate auth alone is sufficient.
+
+        Returns True when a client certificate is provided and the target
+        repository is *not* PyPI/TestPyPI (which always require API tokens).
+        """
+        return bool(self.input.client_cert) and not self.is_pypi()
 
     @property
     @functools.lru_cache()
@@ -136,7 +151,10 @@ class Resolver:
             self.input.username,
             self.config,
             key="username",
-            prompt_strategy=self.username_from_keyring_or_prompt,
+            prompt_strategy=(
+                None if self.allows_cert_auth()
+                else self.username_from_keyring_or_prompt
+            ),
         )
 
     @property
@@ -146,7 +164,10 @@ class Resolver:
             self.input.password,
             self.config,
             key="password",
-            prompt_strategy=self.password_from_keyring_or_trusted_publishing_or_prompt,
+            prompt_strategy=(
+                None if self.allows_cert_auth()
+                else self.password_from_keyring_or_trusted_publishing_or_prompt
+            ),
         )
 
     def _has_valid_cached_tp_token(self) -> bool:

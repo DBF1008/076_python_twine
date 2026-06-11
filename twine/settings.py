@@ -127,12 +127,13 @@ class Settings:
         self._handle_certificates(cacert, client_cert)
         self.auth = auth.Resolver.choose(not non_interactive)(
             self.repository_config,
-            auth.CredentialInput(username, password),
+            auth.CredentialInput(username, password, self.client_cert),
         )
 
     @property
     def username(self) -> Optional[str]:
-        return self.auth.username
+        with self._allow_noninteractive():
+            return self.auth.username
 
     @property
     def password(self) -> Optional[str]:
