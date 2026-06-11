@@ -89,9 +89,6 @@ class TrustedPublishingAuthenticator(requests.auth.AuthBase):
 
 
 class Resolver:
-    _tp_token: t.Optional[TrustedPublishingToken] = None
-    _expires: t.Optional[int] = None
-
     def __init__(
         self,
         config: utils.RepositoryConfig,
@@ -99,6 +96,9 @@ class Resolver:
     ) -> None:
         self.config = config
         self.input = input
+        self._tp_token: t.Optional[TrustedPublishingToken] = None
+        self._expires: t.Optional[int] = None
+        self._tp_repository: t.Optional[str] = None
 
     @property
     @functools.lru_cache()
@@ -150,9 +150,13 @@ class Resolver:
         )
 
     def _has_valid_cached_tp_token(self) -> bool:
-        return self._tp_token is not None and (
-            int(time.time()) + TOKEN_RENEWAL_THRESHOLD.seconds
-            < cast(int, self._tp_token.get("expires", self._expires))
+        if self._tp_token is None:
+            return False
+        repository_domain = urlparse(cast(str, self.system)).netloc
+        if self._tp_repository != repository_domain:
+            return False
+        return int(time.time()) + TOKEN_RENEWAL_THRESHOLD.seconds < cast(
+            int, self._tp_token.get("expires", self._expires)
         )
 
     def _make_trusted_publishing_token(self) -> t.Optional[TrustedPublishingToken]:
@@ -161,6 +165,19 @@ class Resolver:
         # Trusted publishing (OpenID Connect): get one token from the CI
         # system, and exchange that for a PyPI token.
         repository_domain = cast(str, urlparse(self.system).netloc)
+
+        # If we're switching repositories, invalidate the stale token so we
+        # never send a token minted for one index to a different index.
+        if self._tp_repository is not None and self._tp_repository != repository_domain:
+            logger.info(
+                "Repository changed from %s to %s, invalidating cached token",
+                self._tp_repository,
+                repository_domain,
+            )
+            self._tp_token = None
+            self._expires = None
+            self._tp_repository = None
+
         session = utils.make_requests_session()
 
         # Indices are expected to support `https://{domain}/_/oidc/audience`,
@@ -182,13 +199,18 @@ class Resolver:
 
         if oidc_token is None:
             logger.warning("This environment is not supported for trusted publishing")
-            if self._tp_token and int(time.time()) > cast(
-                int, self._tp_token.get("expires", self._expires)
+            # Only consider reusing a cached token if it belongs to the
+            # current repository — never leak a token across indices.
+            if (
+                self._tp_token
+                and self._tp_repository == repository_domain
+                and int(time.time())
+                <= cast(int, self._tp_token.get("expires", self._expires))
             ):
-                return None  # Fall back to prompting for a token (if possible)
-            # The cached trusted publishing token may still be valid for a
-            # while longer, let's continue using it instead of prompting
-            return self._tp_token
+                # The cached trusted publishing token may still be valid for a
+                # while longer, let's continue using it instead of prompting
+                return self._tp_token
+            return None  # Fall back to prompting for a token (if possible)
 
         logger.warning("Got OIDC token for audience %s", audience)
 
@@ -219,6 +241,7 @@ class Resolver:
         logger.warning("Minted upload token for trusted publishing")
         self._tp_token = cast(TrustedPublishingToken, mint_token_payload)
         self._expires = int(time.time()) + 900
+        self._tp_repository = repository_domain
         return self._tp_token
 
     def make_trusted_publishing_token(self) -> t.Optional[str]:

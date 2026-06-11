@@ -392,6 +392,7 @@ def test_trusted_publish_authenticator_refreshes_token(monkeypatch, config):
         token="expiring-tp-token",
     )
     res._expires = int(time.time()) + 4 * 60
+    res._tp_repository = "test.pypi.org"
     monkeypatch.setattr(auth, "detect_credential", detect_credential)
     monkeypatch.setattr(auth.utils, "make_requests_session", make_session)
     authenticator = auth.TrustedPublishingAuthenticator(resolver=res)
@@ -432,6 +433,7 @@ def test_trusted_publish_authenticator_reuses_token(monkeypatch, config):
         token="valid-tp-token",
     )
     res._expires = int(time.time()) + 900
+    res._tp_repository = "test.pypi.org"
     monkeypatch.setattr(auth, "detect_credential", detect_credential)
     monkeypatch.setattr(auth.utils, "make_requests_session", make_session)
     authenticator = auth.TrustedPublishingAuthenticator(resolver=res)
@@ -454,3 +456,277 @@ def test_inability_to_make_token_raises_error():
     )
     with pytest.raises(exceptions.TrustedPublishingFailure):
         authenticator(None)
+
+
+class TestTrustedPublishingRepositoryIsolation:
+    """Tests that trusted publishing tokens are scoped per-repository and never
+    leak across indices (e.g., TestPyPI -> PyPI) within the same process."""
+
+    def test_different_resolver_instances_do_not_share_token(self):
+        """Two Resolver instances for different repos must have independent caches."""
+        testpypi_config: utils.RepositoryConfig = dict(
+            repository=utils.TEST_REPOSITORY
+        )
+        pypi_config: utils.RepositoryConfig = dict(
+            repository=utils.DEFAULT_REPOSITORY
+        )
+        resolver_test = auth.Resolver(
+            testpypi_config, auth.CredentialInput(username="__token__")
+        )
+        resolver_prod = auth.Resolver(
+            pypi_config, auth.CredentialInput(username="__token__")
+        )
+
+        # Simulate TestPyPI resolver acquiring a token
+        resolver_test._tp_token = auth.TrustedPublishingToken(
+            success=True, token="testpypi-token"
+        )
+        resolver_test._expires = int(time.time()) + 900
+        resolver_test._tp_repository = "test.pypi.org"
+
+        # The PyPI resolver must not see the TestPyPI token
+        assert resolver_prod._tp_token is None
+        assert resolver_prod._expires is None
+        assert resolver_prod._tp_repository is None
+
+    def test_cached_token_not_reused_for_different_repository(self, monkeypatch):
+        """A cached token for TestPyPI must not pass _has_valid_cached_tp_token
+        when the resolver is now pointing at PyPI."""
+        config: utils.RepositoryConfig = dict(repository=utils.TEST_REPOSITORY)
+        resolver = auth.Resolver(config, auth.CredentialInput(username="__token__"))
+
+        # Simulate a valid cached token for TestPyPI
+        resolver._tp_token = auth.TrustedPublishingToken(
+            success=True, token="testpypi-token"
+        )
+        resolver._expires = int(time.time()) + 900
+        resolver._tp_repository = "test.pypi.org"
+
+        # Token is valid for the same repo
+        assert resolver._has_valid_cached_tp_token() is True
+
+        # Switch to PyPI — the cached token must NOT be considered valid
+        resolver.config["repository"] = utils.DEFAULT_REPOSITORY
+        assert resolver._has_valid_cached_tp_token() is False
+
+    def test_repository_switch_invalidates_and_mints_new_token(self, monkeypatch):
+        """Switching repositories mid-session must invalidate the old token and
+        mint a fresh one for the new repository."""
+        call_log: t.List[str] = []
+
+        def make_session_for_testpypi():
+            return MockSession(
+                get_response_list=[
+                    MockResponse(200, {"audience": "testpypi-aud"})
+                ],
+                post_response_list=[
+                    MockResponse(
+                        200,
+                        {
+                            "success": True,
+                            "token": "testpypi-token",
+                            "expires": int(time.time()) + 900,
+                        },
+                    )
+                ],
+            )
+
+        def make_session_for_pypi():
+            return MockSession(
+                get_response_list=[
+                    MockResponse(200, {"audience": "pypi-aud"})
+                ],
+                post_response_list=[
+                    MockResponse(
+                        200,
+                        {
+                            "success": True,
+                            "token": "pypi-token",
+                            "expires": int(time.time()) + 900,
+                        },
+                    )
+                ],
+            )
+
+        sessions = iter([make_session_for_testpypi(), make_session_for_pypi()])
+
+        def detect_credential(audience: str) -> str:
+            call_log.append(audience)
+            return "fake-oidc-token"
+
+        monkeypatch.setattr(auth, "detect_credential", detect_credential)
+        monkeypatch.setattr(
+            auth.utils, "make_requests_session", lambda: next(sessions)
+        )
+
+        config: utils.RepositoryConfig = dict(repository=utils.TEST_REPOSITORY)
+        resolver = auth.Resolver(config, auth.CredentialInput(username="__token__"))
+
+        # First call — mint for TestPyPI
+        token1 = resolver.make_trusted_publishing_token()
+        assert token1 == "testpypi-token"
+        assert resolver._tp_repository == "test.pypi.org"
+
+        # Switch repository to PyPI
+        resolver.config["repository"] = utils.DEFAULT_REPOSITORY
+
+        # Second call — must invalidate TestPyPI token and mint for PyPI
+        token2 = resolver.make_trusted_publishing_token()
+        assert token2 == "pypi-token"
+        assert resolver._tp_repository == "upload.pypi.org"
+
+        # Verify both audiences were requested (proving two separate OIDC flows)
+        assert call_log == ["testpypi-aud", "pypi-aud"]
+
+    def test_consecutive_resolvers_testpypi_then_pypi(self, monkeypatch):
+        """End-to-end: two separate Resolver instances (TestPyPI then PyPI) in
+        the same process each mint their own token without cross-contamination."""
+
+        def make_testpypi_session():
+            return MockSession(
+                get_response_list=[
+                    MockResponse(200, {"audience": "testpypi-aud"})
+                ],
+                post_response_list=[
+                    MockResponse(
+                        200,
+                        {
+                            "success": True,
+                            "token": "testpypi-token-value",
+                            "expires": int(time.time()) + 900,
+                        },
+                    )
+                ],
+            )
+
+        def make_pypi_session():
+            return MockSession(
+                get_response_list=[
+                    MockResponse(200, {"audience": "pypi-aud"})
+                ],
+                post_response_list=[
+                    MockResponse(
+                        200,
+                        {
+                            "success": True,
+                            "token": "pypi-token-value",
+                            "expires": int(time.time()) + 900,
+                        },
+                    )
+                ],
+            )
+
+        monkeypatch.setattr(auth, "detect_credential", lambda aud: "oidc-tok")
+
+        # --- Upload to TestPyPI ---
+        monkeypatch.setattr(
+            auth.utils, "make_requests_session", make_testpypi_session
+        )
+        resolver1 = auth.Resolver(
+            dict(repository=utils.TEST_REPOSITORY),
+            auth.CredentialInput(username="__token__"),
+        )
+        t1 = resolver1.make_trusted_publishing_token()
+        assert t1 == "testpypi-token-value"
+        assert resolver1._tp_repository == "test.pypi.org"
+
+        # --- Upload to PyPI ---
+        monkeypatch.setattr(
+            auth.utils, "make_requests_session", make_pypi_session
+        )
+        resolver2 = auth.Resolver(
+            dict(repository=utils.DEFAULT_REPOSITORY),
+            auth.CredentialInput(username="__token__"),
+        )
+        t2 = resolver2.make_trusted_publishing_token()
+        assert t2 == "pypi-token-value"
+        assert resolver2._tp_repository == "upload.pypi.org"
+
+        # Resolvers must be fully independent
+        assert resolver1._tp_token["token"] == "testpypi-token-value"
+        assert resolver2._tp_token["token"] == "pypi-token-value"
+
+    def test_expired_token_falls_back_to_prompt_interactive(self, monkeypatch):
+        """When the cached token has expired and OIDC returns None, an
+        interactive Resolver must fall back to prompting."""
+        config: utils.RepositoryConfig = dict(repository=utils.TEST_REPOSITORY)
+        resolver = auth.Resolver(config, auth.CredentialInput(username="__token__"))
+
+        # Expired token
+        resolver._tp_token = auth.TrustedPublishingToken(
+            success=True, token="expired-token"
+        )
+        resolver._expires = int(time.time()) - 60  # expired 1 minute ago
+        resolver._tp_repository = "test.pypi.org"
+
+        def detect_credential(audience: str) -> None:
+            return None
+
+        monkeypatch.setattr(auth, "detect_credential", detect_credential)
+        monkeypatch.setattr(
+            auth.utils,
+            "make_requests_session",
+            lambda: MockSession(
+                get_response_list=[
+                    MockResponse(200, {"audience": "test-aud"})
+                ],
+                post_response_list=[],
+            ),
+        )
+
+        # _make_trusted_publishing_token should return None (trigger fallback)
+        result = resolver._make_trusted_publishing_token()
+        assert result is None
+
+    def test_expired_token_noninteractive_raises(self, monkeypatch):
+        """When the cached token has expired and OIDC returns None, a
+        non-interactive Private resolver must raise NonInteractive when
+        the full credential chain runs."""
+        config: utils.RepositoryConfig = dict(repository=utils.TEST_REPOSITORY)
+        resolver = auth.Private(config, auth.CredentialInput(username="__token__"))
+
+        # Expired token
+        resolver._tp_token = auth.TrustedPublishingToken(
+            success=True, token="expired-token"
+        )
+        resolver._expires = int(time.time()) - 60
+        resolver._tp_repository = "test.pypi.org"
+
+        monkeypatch.setattr(auth, "detect_credential", lambda aud: None)
+        monkeypatch.setattr(auth, "keyring", None)
+        monkeypatch.setattr(
+            auth.utils,
+            "make_requests_session",
+            lambda: MockSession(
+                get_response_list=[
+                    MockResponse(200, {"audience": "test-aud"})
+                ],
+                post_response_list=[],
+            ),
+        )
+
+        # The full password resolution chain should hit NonInteractive
+        with pytest.raises(exceptions.NonInteractive):
+            resolver.password_from_keyring_or_trusted_publishing_or_prompt()
+
+    def test_valid_token_still_reused_for_same_repository(self, monkeypatch):
+        """A non-expired token for the current repository should be reused
+        without any network calls (regression check)."""
+        config: utils.RepositoryConfig = dict(repository=utils.TEST_REPOSITORY)
+        resolver = auth.Resolver(config, auth.CredentialInput(username="__token__"))
+
+        resolver._tp_token = auth.TrustedPublishingToken(
+            success=True, token="reusable-token"
+        )
+        resolver._expires = int(time.time()) + 900
+        resolver._tp_repository = "test.pypi.org"
+
+        # Should NOT call make_requests_session at all
+        monkeypatch.setattr(
+            auth.utils,
+            "make_requests_session",
+            lambda: (_ for _ in ()).throw(AssertionError("unexpected network call")),
+        )
+
+        token = resolver.make_trusted_publishing_token()
+        assert token == "reusable-token"
