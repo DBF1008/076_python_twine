@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 from contextlib import contextmanager
+from unittest.mock import call, patch
 
 import packaging
 import pretend
@@ -240,7 +241,7 @@ def test_disable_progress_bar_is_forwarded_to_rich(
 
 
 def test_upload_retry(tmpdir, default_repo, caplog):
-    """Print retry messages when the upload response indicates a server error."""
+    """Print retry messages with backoff when the upload response is a server error."""
     default_repo.disable_progress_bar = True
 
     default_repo.session = pretend.stub(
@@ -260,29 +261,283 @@ def test_upload_retry(tmpdir, default_repo, caplog):
         metadata_dictionary=lambda: {"name": "fake"},
     )
 
-    # Upload with default max_redirects of 5
-    default_repo.upload(package)
+    with patch("twine.repository.time.sleep") as mock_sleep, patch(
+        "twine.repository.random.uniform", return_value=0.0
+    ):
+        # Upload with default max_retries of 5
+        default_repo.upload(package)
 
-    assert caplog.messages == [
-        (
-            'Received "500: Internal server error"\n'
-            f"Package upload appears to have failed. Retry {i} of 5."
-        )
-        for i in range(1, 6)
-    ]
+        assert mock_sleep.call_count == 5
+
+    assert len(caplog.messages) == 5
+    for i, msg in enumerate(caplog.messages, 1):
+        assert f"Retry {i} of 5" in msg
+        assert '500: Internal server error' in msg
 
     caplog.clear()
 
-    # Upload with custom max_redirects of 3
-    default_repo.upload(package, 3)
+    with patch("twine.repository.time.sleep") as mock_sleep, patch(
+        "twine.repository.random.uniform", return_value=0.0
+    ):
+        # Upload with custom max_retries of 3
+        default_repo.upload(package, max_retries=3)
 
-    assert caplog.messages == [
-        (
-            'Received "500: Internal server error"\n'
-            f"Package upload appears to have failed. Retry {i} of 3."
+        assert mock_sleep.call_count == 3
+
+    assert len(caplog.messages) == 3
+    for i, msg in enumerate(caplog.messages, 1):
+        assert f"Retry {i} of 3" in msg
+
+
+def test_upload_retry_429(tmpdir, default_repo, caplog):
+    """Retry on 429 Too Many Requests status."""
+    default_repo.disable_progress_bar = True
+
+    default_repo.session = pretend.stub(
+        post=lambda url, data, allow_redirects, headers: response_with(
+            status_code=429, reason="Too Many Requests"
         )
-        for i in range(1, 4)
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep"), patch(
+        "twine.repository.random.uniform", return_value=0.0
+    ):
+        resp = default_repo.upload(package, max_retries=2)
+
+    assert resp.status_code == 429
+    assert len(caplog.messages) == 2
+    assert "429: Too Many Requests" in caplog.messages[0]
+
+
+def test_upload_retry_respects_retry_after_seconds(tmpdir, default_repo, caplog):
+    """Use Retry-After header value (seconds) as delay."""
+    default_repo.disable_progress_bar = True
+
+    resp_with_header = requests.Response()
+    resp_with_header.status_code = 429
+    resp_with_header.reason = "Too Many Requests"
+    resp_with_header.headers["Retry-After"] = "30"
+
+    default_repo.session = pretend.stub(
+        post=lambda url, data, allow_redirects, headers: resp_with_header
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep") as mock_sleep:
+        default_repo.upload(package, max_retries=1)
+
+    mock_sleep.assert_called_once_with(30)
+    assert "in 30.0s" in caplog.messages[0]
+
+
+def test_upload_retry_respects_retry_after_date(tmpdir, default_repo, caplog):
+    """Use Retry-After header value (HTTP-date) as delay."""
+    default_repo.disable_progress_bar = True
+
+    resp_with_header = requests.Response()
+    resp_with_header.status_code = 503
+    resp_with_header.reason = "Service Unavailable"
+    resp_with_header.headers["Retry-After"] = "Wed, 21 Oct 2099 07:28:00 GMT"
+
+    default_repo.session = pretend.stub(
+        post=lambda url, data, allow_redirects, headers: resp_with_header
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep") as mock_sleep:
+        default_repo.upload(package, max_retries=1)
+
+    # The delay should be capped at MAX_RETRY_DELAY (300s) since the date
+    # is far in the future.
+    mock_sleep.assert_called_once_with(repository.MAX_RETRY_DELAY)
+
+
+def test_upload_retry_exponential_backoff(tmpdir, default_repo):
+    """Verify delay doubles each attempt with exponential backoff."""
+    default_repo.disable_progress_bar = True
+    default_repo.retry_delay = 2
+
+    default_repo.session = pretend.stub(
+        post=lambda url, data, allow_redirects, headers: response_with(
+            status_code=500, reason="Internal server error"
+        )
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep") as mock_sleep, patch(
+        "twine.repository.random.uniform", return_value=0.0
+    ):
+        default_repo.upload(package, max_retries=4)
+
+    # delay = retry_delay * 2^(attempt-1): 2, 4, 8, 16
+    assert mock_sleep.call_args_list == [
+        call(2.0),
+        call(4.0),
+        call(8.0),
+        call(16.0),
     ]
+
+
+def test_upload_retry_max_delay_cap(tmpdir, default_repo):
+    """Verify delay is capped at MAX_RETRY_DELAY (300s)."""
+    default_repo.disable_progress_bar = True
+    default_repo.retry_delay = 200
+
+    default_repo.session = pretend.stub(
+        post=lambda url, data, allow_redirects, headers: response_with(
+            status_code=500, reason="Internal server error"
+        )
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep") as mock_sleep, patch(
+        "twine.repository.random.uniform", return_value=0.0
+    ):
+        default_repo.upload(package, max_retries=2)
+
+    # 200*1=200, 200*2=400 -> capped to 300
+    assert mock_sleep.call_args_list == [
+        call(200.0),
+        call(repository.MAX_RETRY_DELAY),
+    ]
+
+
+def test_upload_retry_success_after_transient_failure(tmpdir, default_repo, caplog):
+    """Succeed after a transient 429 followed by 200."""
+    default_repo.disable_progress_bar = True
+
+    responses = [
+        response_with(status_code=429, reason="Too Many Requests"),
+        response_with(status_code=200, reason="OK"),
+    ]
+    call_count = {"n": 0}
+
+    def fake_post(url, data, allow_redirects, headers):
+        resp = responses[call_count["n"]]
+        call_count["n"] += 1
+        return resp
+
+    default_repo.session = pretend.stub(post=fake_post)
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep"), patch(
+        "twine.repository.random.uniform", return_value=0.0
+    ):
+        resp = default_repo.upload(package)
+
+    assert resp.status_code == 200
+    assert len(caplog.messages) == 1
+    assert "429: Too Many Requests" in caplog.messages[0]
+
+
+def test_upload_no_retry_on_non_retryable(tmpdir, default_repo, caplog):
+    """Return immediately on non-retryable status codes like 400 and 403."""
+    default_repo.disable_progress_bar = True
+
+    default_repo.session = pretend.stub(
+        post=lambda url, data, allow_redirects, headers: response_with(
+            status_code=403, reason="Forbidden"
+        )
+    )
+
+    fakefile = tmpdir.join("fake.whl")
+    fakefile.write(".")
+
+    package = pretend.stub(
+        safe_name="fake",
+        metadata=pretend.stub(version="2.12.0"),
+        basefilename="fake.whl",
+        filename=str(fakefile),
+        metadata_dictionary=lambda: {"name": "fake"},
+    )
+
+    with patch("twine.repository.time.sleep") as mock_sleep:
+        resp = default_repo.upload(package)
+
+    assert resp.status_code == 403
+    mock_sleep.assert_not_called()
+    assert len(caplog.messages) == 0
+
+
+def test_parse_retry_after_integer():
+    """Parse integer Retry-After header."""
+    resp = requests.Response()
+    resp.headers["Retry-After"] = "120"
+    assert repository.Repository._parse_retry_after(resp) == 120
+
+
+def test_parse_retry_after_missing():
+    """Return None when Retry-After header is absent."""
+    resp = requests.Response()
+    assert repository.Repository._parse_retry_after(resp) is None
+
+
+def test_parse_retry_after_invalid():
+    """Return None when Retry-After header is unparseable."""
+    resp = requests.Response()
+    resp.headers["Retry-After"] = "not-a-number-or-date"
+    assert repository.Repository._parse_retry_after(resp) is None
 
 
 @pytest.mark.parametrize(

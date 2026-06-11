@@ -61,6 +61,8 @@ class Settings:
         repository_url: Optional[str] = None,
         verbose: bool = False,
         disable_progress_bar: bool = False,
+        max_retries: int = 5,
+        retry_delay: float = 10,
         **ignored_kwargs: Any,
     ) -> None:
         """Initialize our settings instance.
@@ -113,6 +115,8 @@ class Settings:
         self.verbose = verbose
         self.disable_progress_bar = disable_progress_bar
         self.skip_existing = skip_existing
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         self._handle_repository_options(
             repository_name=repository_name,
             repository_url=repository_url,
@@ -278,6 +282,28 @@ class Settings:
             action="store_true",
             help="Disable the progress bar.",
         )
+        parser.add_argument(
+            "--max-retries",
+            action=utils.EnvironmentDefault,
+            env="TWINE_MAX_RETRIES",
+            default=5,
+            type=int,
+            required=False,
+            help="Maximum number of retries per file on 429/5xx responses "
+            "[default: %(default)s]. "
+            "(Can also be set via %(env)s environment variable.)",
+        )
+        parser.add_argument(
+            "--retry-delay",
+            action=utils.EnvironmentDefault,
+            env="TWINE_RETRY_DELAY",
+            default=10,
+            type=float,
+            required=False,
+            help="Base delay in seconds for exponential backoff between retries "
+            "[default: %(default)s]. "
+            "(Can also be set via %(env)s environment variable.)",
+        )
 
     @classmethod
     def from_argparse(cls, args: argparse.Namespace) -> "Settings":
@@ -354,6 +380,8 @@ class Settings:
             self.username,
             self.password,
             self.disable_progress_bar,
+            max_retries=self.max_retries,
+            retry_delay=self.retry_delay,
         )
         repo.set_certificate_authority(self.cacert)
         repo.set_client_certificate(self.client_cert)

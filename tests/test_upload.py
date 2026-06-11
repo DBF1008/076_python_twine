@@ -586,3 +586,43 @@ def test_upload_warns_attestations_non_pypi(upload_settings, caplog, stub_respon
         "failures, remove the --attestations flag and re-try this command"
         in caplog.messages
     )
+
+
+def test_retry_params_from_cli(monkeypatch):
+    """Verify --max-retries and --retry-delay reach the Settings object."""
+
+    def none_upload(*args, **settings_kwargs):
+        pass
+
+    replaced_upload = pretend.call_recorder(none_upload)
+    monkeypatch.setattr(upload, "upload", replaced_upload)
+    monkeypatch.setenv("TWINE_USERNAME", "user")
+    monkeypatch.setenv("TWINE_PASSWORD", "pass")
+
+    cli.dispatch(
+        ["upload", "--max-retries", "8", "--retry-delay", "15.5", "path/to/file"]
+    )
+
+    upload_settings = replaced_upload.calls[0].args[0]
+    assert upload_settings.max_retries == 8
+    assert upload_settings.retry_delay == 15.5
+
+
+def test_retry_params_from_env(monkeypatch):
+    """Verify TWINE_MAX_RETRIES and TWINE_RETRY_DELAY env vars are picked up."""
+
+    def none_upload(*args, **settings_kwargs):
+        pass
+
+    replaced_upload = pretend.call_recorder(none_upload)
+    monkeypatch.setattr(upload, "upload", replaced_upload)
+    monkeypatch.setenv("TWINE_USERNAME", "user")
+    monkeypatch.setenv("TWINE_PASSWORD", "pass")
+    monkeypatch.setenv("TWINE_MAX_RETRIES", "3")
+    monkeypatch.setenv("TWINE_RETRY_DELAY", "20")
+
+    cli.dispatch(["upload", "path/to/file"])
+
+    upload_settings = replaced_upload.calls[0].args[0]
+    assert upload_settings.max_retries == 3
+    assert upload_settings.retry_delay == 20.0

@@ -198,3 +198,43 @@ class TestArgumentParsing:
     def test_attestations_flag(self):
         args = self.parse_args(["--attestations"])
         assert args.attestations
+
+    def test_max_retries_default(self):
+        args = self.parse_args([])
+        assert args.max_retries == 5
+
+    def test_max_retries_flag(self):
+        args = self.parse_args(["--max-retries", "10"])
+        assert args.max_retries == 10
+
+    def test_max_retries_environment(self, monkeypatch):
+        monkeypatch.setenv("TWINE_MAX_RETRIES", "3")
+        args = self.parse_args([])
+        assert args.max_retries == 3
+
+    def test_retry_delay_default(self):
+        args = self.parse_args([])
+        assert args.retry_delay == 10
+
+    def test_retry_delay_flag(self):
+        args = self.parse_args(["--retry-delay", "5.5"])
+        assert args.retry_delay == 5.5
+
+    def test_retry_delay_environment(self, monkeypatch):
+        monkeypatch.setenv("TWINE_RETRY_DELAY", "20")
+        args = self.parse_args([])
+        assert args.retry_delay == 20.0
+
+
+def test_settings_retry_defaults(make_settings):
+    """Settings uses correct default values for retry parameters."""
+    s = make_settings()
+    assert s.max_retries == 5
+    assert s.retry_delay == 10
+
+
+def test_settings_retry_custom(make_settings):
+    """Settings accepts custom retry parameters."""
+    s = make_settings(max_retries=10, retry_delay=30.0)
+    assert s.max_retries == 10
+    assert s.retry_delay == 30.0

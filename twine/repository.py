@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import random
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
@@ -29,6 +33,8 @@ OLD_WAREHOUSE = "https://upload.pypi.io/"
 TEST_WAREHOUSE = "https://test.pypi.org/"
 WAREHOUSE_WEB = "https://pypi.org/"
 
+MAX_RETRY_DELAY = 300  # 5 minutes
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +45,8 @@ class Repository:
         username: Optional[str],
         password: Optional[str],
         disable_progress_bar: bool = False,
+        max_retries: int = 5,
+        retry_delay: float = 10,
     ) -> None:
         self.url = repository_url
 
@@ -55,6 +63,8 @@ class Repository:
         # Working around https://github.com/python/typing/issues/182
         self._releases_json_data: Dict[str, Dict[str, Any]] = {}
         self.disable_progress_bar = disable_progress_bar
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
 
     def close(self) -> None:
         self.session.close()
@@ -157,26 +167,63 @@ class Repository:
 
         return resp
 
+    @staticmethod
+    def _parse_retry_after(response: requests.Response) -> Optional[float]:
+        """Parse the Retry-After header from a response.
+
+        Supports both integer seconds and HTTP-date formats (RFC 7231).
+        Returns the number of seconds to wait, or None if absent/invalid.
+        """
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is None:
+            return None
+
+        # Try integer seconds first
+        try:
+            return max(0, int(retry_after))
+        except ValueError:
+            pass
+
+        # Try HTTP-date format
+        try:
+            retry_date = parsedate_to_datetime(retry_after)
+            delay = (retry_date - datetime.now(timezone.utc)).total_seconds()
+            return max(0, delay)
+        except (ValueError, TypeError):
+            return None
+
+    def _is_retryable(self, status_code: int) -> bool:
+        """Determine if a response status code is retryable."""
+        return status_code == 429 or 500 <= status_code < 600
+
     def upload(
-        self, package: package_file.PackageFile, max_redirects: int = 5
+        self, package: package_file.PackageFile, max_retries: Optional[int] = None
     ) -> requests.Response:
-        number_of_redirects = 0
-        while number_of_redirects < max_redirects:
+        retries = max_retries if max_retries is not None else self.max_retries
+        attempt = 0
+        while True:
             resp = self._upload(package)
 
             if resp.status_code == requests.codes.OK:
                 return resp
-            if 500 <= resp.status_code < 600:
-                number_of_redirects += 1
-                logger.warning(
-                    f'Received "{resp.status_code}: {resp.reason}"'
-                    "\nPackage upload appears to have failed."
-                    f" Retry {number_of_redirects} of {max_redirects}."
-                )
-            else:
+
+            if not self._is_retryable(resp.status_code) or attempt >= retries:
                 return resp
 
-        return resp
+            attempt += 1
+
+            retry_after = self._parse_retry_after(resp)
+            if retry_after is not None:
+                delay = retry_after
+            else:
+                delay = self.retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
+            delay = min(delay, MAX_RETRY_DELAY)
+
+            logger.warning(
+                f'Received "{resp.status_code}: {resp.reason}". '
+                f"Retry {attempt} of {retries} in {delay:.1f}s."
+            )
+            time.sleep(delay)
 
     def package_is_uploaded(
         self, package: package_file.PackageFile, bypass_cache: bool = False
