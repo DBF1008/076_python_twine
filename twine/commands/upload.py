@@ -20,6 +20,7 @@ from typing import Dict, List, cast
 import requests
 from rich import print
 
+from twine import auth
 from twine import commands
 from twine import exceptions
 from twine import package as package_file
@@ -80,7 +81,7 @@ def _make_package(
     signed_name = package.signed_basefilename
     if signed_name in signatures:
         package.add_gpg_signature(signatures[signed_name], signed_name)
-    elif upload_settings.sign:
+    elif upload_settings.sign and not upload_settings.dry_run:
         package.sign(upload_settings.sign_with, upload_settings.identity)
 
     # Attestations are only attached if explicitly requested with `--attestations`.
@@ -100,6 +101,78 @@ def _make_package(
         logger.info(f"Signed with {package.signed_filename}")
 
     return package
+
+
+def _detect_auth_mode(upload_settings: settings.Settings) -> str:
+    """Detect the authentication mode without triggering prompts or network calls."""
+    if upload_settings.client_cert:
+        return f"Client certificate ({upload_settings.client_cert})"
+
+    input_username = upload_settings.auth.input.username
+    input_password = upload_settings.auth.input.password
+    config_username = upload_settings.auth.config.get("username")
+    config_password = upload_settings.auth.config.get("password")
+
+    is_pypi = upload_settings.auth.is_pypi()
+
+    effective_username = input_username or config_username
+    if is_pypi and not effective_username:
+        effective_username = auth.TOKEN_USERNAME
+
+    effective_password = input_password or config_password
+
+    if effective_username == auth.TOKEN_USERNAME:
+        if effective_password:
+            return "API token"
+        elif is_pypi:
+            return "Trusted publishing (or API token at prompt)"
+        else:
+            return "Token (will be prompted)"
+    elif effective_username and effective_password:
+        return f"Username/password (username: {effective_username})"
+    elif effective_username:
+        return f"Username '{effective_username}' (password from keyring or prompt)"
+    else:
+        return "Credentials will be prompted"
+
+
+def _print_dry_run_plan(
+    packages: List[package_file.PackageFile],
+    upload_settings: settings.Settings,
+    repository_url: str,
+) -> None:
+    """Print a detailed plan of what would be uploaded."""
+    print("\nDry run - the following uploads are planned:\n")
+    print(f"  Repository:  {utils.sanitize_url(repository_url)}")
+    print(f"  Auth mode:   {_detect_auth_mode(upload_settings)}")
+    print(f"  Packages:    {len(packages)}")
+    print()
+
+    for i, package in enumerate(packages, 1):
+        print(f"  Package {i}/{len(packages)}:")
+        print(f"    File:           {package.basefilename}")
+        print(f"    Name:           {package.safe_name}")
+        print(f"    Version:        {package.version}")
+        print(f"    Type:           {package.filetype}")
+        print(f"    Python version: {package.python_version}")
+        if package.sha2_digest:
+            print(f"    SHA256:         {package.sha2_digest}")
+        if package.blake2_256_digest:
+            print(f"    BLAKE2-256:     {package.blake2_256_digest}")
+        if package.gpg_signature:
+            print(f"    GPG signature:  {package.gpg_signature[0]}")
+        elif upload_settings.sign:
+            sign_with = upload_settings.sign_with or "gpg"
+            print(f"    GPG signature:  Would sign with {sign_with}")
+        else:
+            print("    GPG signature:  None")
+        if package.attestations:
+            print(f"    Attestations:   {len(package.attestations)}")
+        else:
+            print("    Attestations:   None")
+        print()
+
+    print("Dry run complete. No files were uploaded.")
 
 
 def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
@@ -173,6 +246,10 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
                 "information"
             )
 
+    if upload_settings.dry_run:
+        _print_dry_run_plan(packages_to_upload, upload_settings, repository_url)
+        return
+
     repository = upload_settings.create_repository()
     uploaded_packages = []
 
@@ -244,6 +321,12 @@ def main(args: List[str]) -> None:
         "(package index). Usually dist/* . May additionally contain "
         "a .asc file to include an existing signature with the "
         "file upload.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Show what would be uploaded without actually uploading.",
     )
 
     parsed_args = parser.parse_args(args)

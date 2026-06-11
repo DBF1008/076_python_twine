@@ -586,3 +586,177 @@ def test_upload_warns_attestations_non_pypi(upload_settings, caplog, stub_respon
         "failures, remove the --attestations flag and re-try this command"
         in caplog.messages
     )
+
+
+# --- dry-run tests ---
+
+
+def test_dry_run_shows_plan_and_does_not_upload(
+    make_settings, stub_repository, capsys
+):
+    upload_settings = make_settings(dry_run=True)
+    upload_settings.create_repository = lambda: stub_repository
+
+    result = upload.upload(
+        upload_settings,
+        [helpers.WHEEL_FIXTURE, helpers.SDIST_FIXTURE],
+    )
+    assert result is None
+
+    captured = capsys.readouterr()
+    assert "Dry run" in captured.out
+    assert "twine-4.0.2-py3-none-any.whl" in captured.out
+    assert "twine-1.5.0.tar.gz" in captured.out
+    assert "No files were uploaded" in captured.out
+
+    # repository.upload was never called
+    assert stub_repository.upload.calls == []
+
+
+def test_dry_run_does_not_create_repository(make_settings, capsys):
+    upload_settings = make_settings(dry_run=True)
+    upload_settings.create_repository = pretend.raiser(
+        AssertionError("create_repository should not be called during dry run")
+    )
+
+    # Should not raise -- create_repository should never be called
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "Dry run" in captured.out
+
+
+def test_dry_run_shows_repository_url(make_settings, capsys):
+    upload_settings = make_settings(dry_run=True)
+
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "upload.pypi.org" in captured.out
+
+
+def test_dry_run_shows_auth_mode_token(make_settings, capsys):
+    upload_settings = make_settings(
+        dry_run=True,
+        username="__token__",
+        password="pypi-fakefakefake",
+    )
+
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "API token" in captured.out
+
+
+def test_dry_run_shows_auth_mode_username_password(make_settings, capsys):
+    upload_settings = make_settings(
+        dry_run=True,
+        config="""
+            [distutils]
+            index-servers =
+                notpypi
+            [notpypi]
+            repository: https://upload.example.org/legacy/
+            username:someuser
+            password:somepass
+        """,
+        repository_name="notpypi",
+    )
+
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "Username/password" in captured.out
+    assert "someuser" in captured.out
+
+
+def test_dry_run_shows_auth_mode_client_cert(make_settings, capsys, tmp_path):
+    cert_file = tmp_path / "cert.pem"
+    cert_file.write_text("fake cert")
+
+    upload_settings = make_settings(
+        dry_run=True,
+        client_cert=str(cert_file),
+    )
+
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "Client certificate" in captured.out
+
+
+def test_dry_run_shows_package_metadata(make_settings, capsys):
+    upload_settings = make_settings(dry_run=True)
+
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "twine" in captured.out
+    assert "4.0.2" in captured.out
+    assert "bdist_wheel" in captured.out
+    assert "py3" in captured.out
+    assert "SHA256" in captured.out
+
+
+def test_dry_run_with_pre_signed_distribution(make_settings, capsys):
+    upload_settings = make_settings(dry_run=True)
+
+    upload.upload(
+        upload_settings,
+        [helpers.WHEEL_FIXTURE, helpers.WHEEL_FIXTURE + ".asc"],
+    )
+
+    captured = capsys.readouterr()
+    assert "GPG signature" in captured.out
+    assert "twine-4.0.2-py3-none-any.whl.asc" in captured.out
+
+
+def test_dry_run_skips_gpg_signing(make_settings, monkeypatch, capsys):
+    upload_settings = make_settings(dry_run=True, sign=True, sign_with="gpg")
+
+    monkeypatch.setattr(
+        package_file.PackageFile,
+        "sign",
+        pretend.raiser(
+            AssertionError("sign should not be called during dry run")
+        ),
+    )
+
+    upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+    captured = capsys.readouterr()
+    assert "Dry run" in captured.out
+    assert "Would sign with gpg" in captured.out
+
+
+def test_dry_run_still_validates_repository_url(make_settings):
+    with pytest.raises(exceptions.UploadToDeprecatedPyPIDetected):
+        upload_settings = make_settings(
+            dry_run=True,
+            config="""
+                [pypi]
+                repository: https://pypi.python.org/pypi/
+                username:foo
+                password:bar
+            """,
+        )
+        upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+
+
+def test_dry_run_via_cli(write_config_file, monkeypatch):
+    replaced_upload = pretend.call_recorder(lambda settings, dists: None)
+    monkeypatch.setattr(upload, "upload", replaced_upload)
+
+    config_file = write_config_file("""
+        [pypi]
+        username:foo
+        password:bar
+    """)
+
+    upload.main(
+        ["--dry-run", "--config-file", str(config_file), helpers.WHEEL_FIXTURE]
+    )
+
+    assert replaced_upload.calls
+    settings_used = replaced_upload.calls[0].args[0]
+    assert settings_used.dry_run is True

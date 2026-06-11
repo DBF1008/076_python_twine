@@ -61,6 +61,7 @@ class Settings:
         repository_url: Optional[str] = None,
         verbose: bool = False,
         disable_progress_bar: bool = False,
+        dry_run: bool = False,
         **ignored_kwargs: Any,
     ) -> None:
         """Initialize our settings instance.
@@ -112,6 +113,7 @@ class Settings:
         self.comment = comment
         self.verbose = verbose
         self.disable_progress_bar = disable_progress_bar
+        self.dry_run = dry_run
         self.skip_existing = skip_existing
         self._handle_repository_options(
             repository_name=repository_name,
