@@ -18,6 +18,7 @@ import requests
 
 from twine import __main__ as dunder_main
 from twine.commands import upload
+from twine import upload_result as result_mod
 
 # Hard-coding control characters for red text; couldn't find a succinct alternative
 RED_ERROR = "\x1b[31mERROR   \x1b[0m"
@@ -89,3 +90,33 @@ def test_no_color_exception(monkeypatch, capsys):
 
 
 # TODO: Test verbose output formatting
+
+
+def test_integer_exit_code_passthrough(monkeypatch):
+    """An integer exit code from dispatch is passed through unchanged."""
+    monkeypatch.setattr(sys, "argv", ["twine", "upload", "test.whl"])
+    monkeypatch.setattr(
+        upload,
+        "upload",
+        lambda *a, **kw: result_mod.UploadReport("url", [
+            result_mod.FileUploadResult(
+                "a.whl", "success", None, False, False, None
+            ),
+            result_mod.FileUploadResult(
+                "b.whl", "failed", "err", False, False, None
+            ),
+        ]),
+    )
+
+    result = dunder_main.main()
+    # Partial success => exit code 2
+    assert result == 2
+
+
+def test_none_result_exits_zero(monkeypatch):
+    """A None result from dispatch exits with 0."""
+    monkeypatch.setattr(sys, "argv", ["twine", "upload", "test.whl"])
+    monkeypatch.setattr(upload, "upload", lambda *a, **kw: None)
+
+    result = dunder_main.main()
+    assert result == False  # noqa: E712

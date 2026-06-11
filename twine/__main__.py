@@ -30,12 +30,11 @@ def main() -> Any:
     cli.configure_output()
 
     try:
-        error = cli.dispatch(sys.argv[1:])
+        result = cli.dispatch(sys.argv[1:])
     except requests.HTTPError as exc:
         # Assuming this response will never be None
         response = cast(requests.Response, exc.response)
 
-        error = True
         status_code = response.status_code
 
         try:
@@ -56,11 +55,16 @@ def main() -> Any:
             f"from {response.url}\n"
             f"{response.reason}"
         )
+        return 1
     except exceptions.TwineException as exc:
-        error = True
         logger.error(f"{exc.__class__.__name__}: {exc.args[0]}")
+        return 1
 
-    return error
+    # An integer result (e.g. from upload --result-file) is an explicit exit
+    # code; pass it through directly.
+    if isinstance(result, int):
+        return result
+    return bool(result)
 
 
 if __name__ == "__main__":

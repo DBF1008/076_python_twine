@@ -15,7 +15,7 @@
 # limitations under the License.
 import argparse
 import logging
-from typing import Dict, List, cast
+from typing import Dict, List, Optional, Union, cast
 
 import requests
 from rich import print
@@ -24,6 +24,7 @@ from twine import commands
 from twine import exceptions
 from twine import package as package_file
 from twine import settings
+from twine import upload_result as result_mod
 from twine import utils
 
 logger = logging.getLogger(__name__)
@@ -102,7 +103,9 @@ def _make_package(
     return package
 
 
-def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
+def upload(
+    upload_settings: settings.Settings, dists: List[str]
+) -> Optional[result_mod.UploadReport]:
     """Upload one or more distributions to a repository, and display the progress.
 
     If a package already exists on the repository, most repositories will return an
@@ -111,6 +114,10 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
 
     For known repositories (like PyPI), the web URLs of successfully uploaded packages
     will be displayed.
+
+    When ``upload_settings.result_file`` is set, per-file results are collected and
+    returned as an :class:`~twine.upload_result.UploadReport`.  In this mode, a single
+    file failure does not abort subsequent uploads.
 
     :param upload_settings:
         The configured options related to uploading to a repository.
@@ -122,7 +129,7 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
     :raises twine.exceptions.TwineException:
         The upload failed due to a configuration error.
     :raises requests.HTTPError:
-        The repository responded with an error.
+        The repository responded with an error (only when ``result_file`` is not set).
     """
     upload_settings.check_repository_url()
     upload_settings.verify_feature_capability()
@@ -182,40 +189,90 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
             "corresponding distribution file."
         )
 
+    collect_results = upload_settings.result_file is not None
+    results: List[result_mod.FileUploadResult] = []
+
     for package in packages_to_upload:
         skip_message = (
             f"Skipping {package.basefilename} because it appears to already exist"
         )
+
+        has_sig = package.gpg_signature is not None
+        has_att = bool(package.attestations)
 
         # Note: The skip_existing check *needs* to be first, because otherwise
         #       we're going to generate extra HTTP requests against a hardcoded
         #       URL for no reason.
         if upload_settings.skip_existing and repository.package_is_uploaded(package):
             logger.warning(skip_message)
+            if collect_results:
+                results.append(result_mod.FileUploadResult(
+                    filename=package.basefilename,
+                    status="skipped",
+                    error_message=None,
+                    has_signature=has_sig,
+                    has_attestations=has_att,
+                    release_url=None,
+                ))
             continue
 
-        resp = repository.upload(package)
-        logger.info(f"Response from {resp.url}:\n{resp.status_code} {resp.reason}")
-        if resp.text:
-            logger.info(resp.text)
+        try:
+            resp = repository.upload(package)
+            logger.info(f"Response from {resp.url}:\n{resp.status_code} {resp.reason}")
+            if resp.text:
+                logger.info(resp.text)
 
-        # Bug 92. If we get a redirect we should abort because something seems
-        # funky. The behaviour is not well defined and redirects being issued
-        # by PyPI should never happen in reality. This should catch malicious
-        # redirects as well.
-        if resp.is_redirect:
-            raise exceptions.RedirectDetected.from_args(
-                utils.sanitize_url(repository_url),
-                utils.sanitize_url(resp.headers["location"]),
-            )
+            # Bug 92. If we get a redirect we should abort because something seems
+            # funky. The behaviour is not well defined and redirects being issued
+            # by PyPI should never happen in reality. This should catch malicious
+            # redirects as well.
+            if resp.is_redirect:
+                raise exceptions.RedirectDetected.from_args(
+                    utils.sanitize_url(repository_url),
+                    utils.sanitize_url(resp.headers["location"]),
+                )
 
-        if skip_upload(resp, upload_settings.skip_existing, package):
-            logger.warning(skip_message)
-            continue
+            if skip_upload(resp, upload_settings.skip_existing, package):
+                logger.warning(skip_message)
+                if collect_results:
+                    results.append(result_mod.FileUploadResult(
+                        filename=package.basefilename,
+                        status="skipped",
+                        error_message=None,
+                        has_signature=has_sig,
+                        has_attestations=has_att,
+                        release_url=None,
+                    ))
+                continue
 
-        utils.check_status_code(resp, upload_settings.verbose)
+            utils.check_status_code(resp, upload_settings.verbose)
 
-        uploaded_packages.append(package)
+            uploaded_packages.append(package)
+            if collect_results:
+                release_url = result_mod.release_url_for_package(
+                    repository_url, package
+                )
+                results.append(result_mod.FileUploadResult(
+                    filename=package.basefilename,
+                    status="success",
+                    error_message=None,
+                    has_signature=has_sig,
+                    has_attestations=has_att,
+                    release_url=release_url,
+                ))
+
+        except (requests.HTTPError, exceptions.TwineException) as exc:
+            if not collect_results:
+                raise
+            logger.error(f"Failed to upload {package.basefilename}: {exc}")
+            results.append(result_mod.FileUploadResult(
+                filename=package.basefilename,
+                status="failed",
+                error_message=str(exc),
+                has_signature=has_sig,
+                has_attestations=has_att,
+                release_url=None,
+            ))
 
     release_urls = repository.release_urls(uploaded_packages)
     if release_urls:
@@ -227,8 +284,19 @@ def upload(upload_settings: settings.Settings, dists: List[str]) -> None:
     # pool.
     repository.close()
 
+    if collect_results:
+        report = result_mod.UploadReport(
+            repository_url=repository_url,
+            files=results,
+        )
+        result_mod.print_summary(report)
+        result_mod.write_result_file(report, upload_settings.result_file)
+        return report
 
-def main(args: List[str]) -> None:
+    return None
+
+
+def main(args: List[str]) -> Optional[int]:
     """Execute the ``upload`` command.
 
     :param args:
@@ -250,4 +318,7 @@ def main(args: List[str]) -> None:
     upload_settings = settings.Settings.from_argparse(parsed_args)
 
     # Call the upload function with the arguments from the command line
-    return upload(upload_settings, parsed_args.dists)
+    report = upload(upload_settings, parsed_args.dists)
+    if report is not None:
+        return result_mod.determine_exit_code(report)
+    return None

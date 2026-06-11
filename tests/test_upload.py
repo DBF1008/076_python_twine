@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
 
 import pretend
@@ -20,6 +21,7 @@ import requests
 from twine import cli
 from twine import exceptions
 from twine import package as package_file
+from twine import upload_result as result_mod
 from twine.commands import upload
 
 from . import helpers
@@ -586,3 +588,214 @@ def test_upload_warns_attestations_non_pypi(upload_settings, caplog, stub_respon
         "failures, remove the --attestations flag and re-try this command"
         in caplog.messages
     )
+
+
+# --- Structured result reporting (--result-file) ---
+
+
+@pytest.fixture
+def result_file(tmp_path):
+    """Return a path for the upload result JSON file."""
+    return str(tmp_path / "upload_result.json")
+
+
+@pytest.fixture
+def upload_settings_with_result_file(make_settings, stub_repository, result_file):
+    """Upload settings with --result-file set."""
+    s = make_settings(result_file=result_file)
+    s.create_repository = lambda: stub_repository
+    return s
+
+
+def test_upload_returns_report_with_result_file(
+    upload_settings_with_result_file, result_file
+):
+    """Return an UploadReport when --result-file is set."""
+    report = upload.upload(
+        upload_settings_with_result_file,
+        [helpers.WHEEL_FIXTURE, helpers.NEW_WHEEL_FIXTURE],
+    )
+    assert isinstance(report, result_mod.UploadReport)
+    assert len(report.files) == 2
+    assert all(f.status == "success" for f in report.files)
+
+
+def test_upload_returns_none_without_result_file(upload_settings):
+    """Return None when --result-file is not set (backward compatibility)."""
+    result = upload.upload(upload_settings, [helpers.WHEEL_FIXTURE])
+    assert result is None
+
+
+def test_upload_result_file_written(upload_settings_with_result_file, result_file):
+    """Write a valid JSON result file at the specified path."""
+    upload.upload(
+        upload_settings_with_result_file, [helpers.WHEEL_FIXTURE]
+    )
+    with open(result_file) as f:
+        data = json.load(f)
+
+    assert data["schema_version"] == "1.0"
+    assert data["summary"]["total"] == 1
+    assert data["summary"]["success"] == 1
+    assert data["files"][0]["filename"] == "twine-4.0.2-py3-none-any.whl"
+    assert data["files"][0]["status"] == "success"
+
+
+def test_upload_continue_on_failure(make_settings, result_file):
+    """Continue uploading remaining files after a failure when --result-file is set."""
+    call_count = [0]
+    success_resp = pretend.stub(
+        is_redirect=False,
+        url="https://test.pypi.org/legacy/",
+        status_code=200,
+        reason="OK",
+        text=None,
+        raise_for_status=lambda: None,
+    )
+    error_resp = pretend.stub(
+        is_redirect=False,
+        url="https://test.pypi.org/legacy/",
+        status_code=403,
+        reason="Forbidden",
+        text="Forbidden",
+        raise_for_status=pretend.raiser(requests.HTTPError),
+    )
+
+    def _upload(package):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return error_resp
+        return success_resp
+
+    repo = pretend.stub(
+        upload=_upload,
+        close=lambda: None,
+        release_urls=lambda packages: set(),
+    )
+
+    s = make_settings(result_file=result_file)
+    s.create_repository = lambda: repo
+
+    report = upload.upload(
+        s, [helpers.WHEEL_FIXTURE, helpers.NEW_WHEEL_FIXTURE]
+    )
+
+    assert isinstance(report, result_mod.UploadReport)
+    assert len(report.files) == 2
+    assert report.files[0].status == "failed"
+    assert report.files[0].error_message is not None
+    assert report.files[1].status == "success"
+
+
+def test_upload_aborts_on_failure_without_result_file(
+    upload_settings, stub_response
+):
+    """Abort on first failure when --result-file is not set (existing behavior)."""
+    stub_response.status_code = 403
+    stub_response.reason = "Forbidden"
+    stub_response.text = "Forbidden"
+    stub_response.raise_for_status = pretend.raiser(requests.HTTPError)
+
+    with pytest.raises(requests.HTTPError):
+        upload.upload(
+            upload_settings,
+            [helpers.WHEEL_FIXTURE, helpers.NEW_WHEEL_FIXTURE],
+        )
+
+
+def test_upload_all_skipped_result(
+    upload_settings_with_result_file, stub_repository, result_file
+):
+    """Report skipped status for all packages when skip_existing is set."""
+    upload_settings_with_result_file.skip_existing = True
+    stub_repository.package_is_uploaded = lambda package: True
+
+    report = upload.upload(
+        upload_settings_with_result_file,
+        [helpers.WHEEL_FIXTURE, helpers.NEW_WHEEL_FIXTURE],
+    )
+
+    assert isinstance(report, result_mod.UploadReport)
+    assert len(report.files) == 2
+    assert all(f.status == "skipped" for f in report.files)
+    assert all(f.release_url is None for f in report.files)
+
+
+def test_upload_result_has_signature_status(
+    upload_settings_with_result_file, result_file
+):
+    """Report has_signature=True when a GPG signature is present."""
+    report = upload.upload(
+        upload_settings_with_result_file,
+        [helpers.WHEEL_FIXTURE, helpers.WHEEL_FIXTURE + ".asc"],
+    )
+
+    assert isinstance(report, result_mod.UploadReport)
+    assert report.files[0].has_signature is True
+
+
+def test_upload_result_summary_printed(
+    upload_settings_with_result_file, capsys
+):
+    """Print a human-readable summary table to stdout."""
+    upload.upload(
+        upload_settings_with_result_file, [helpers.WHEEL_FIXTURE]
+    )
+    captured = capsys.readouterr().out
+    assert "Upload Summary" in captured
+    assert "twine-4.0.2-py3-none-any.whl" in captured
+    assert "success" in captured
+
+
+def test_upload_main_returns_exit_code_with_result_file(
+    monkeypatch, result_file
+):
+    """The main() function returns an integer exit code when --result-file is set."""
+    monkeypatch.setattr(
+        upload,
+        "upload",
+        lambda settings, dists: result_mod.UploadReport(
+            "url",
+            [result_mod.FileUploadResult(
+                "a.whl", "success", None, False, False, None
+            )],
+        ),
+    )
+
+    exit_code = upload.main(
+        ["--result-file", result_file, helpers.WHEEL_FIXTURE]
+    )
+    assert exit_code == 0
+
+
+def test_upload_main_returns_none_without_result_file(monkeypatch):
+    """The main() function returns None when --result-file is not set."""
+    monkeypatch.setattr(
+        upload, "upload", lambda settings, dists: None
+    )
+    result = upload.main([helpers.WHEEL_FIXTURE])
+    assert result is None
+
+
+def test_upload_partial_success_exit_code(monkeypatch, result_file):
+    """The main() function returns exit code 2 for partial success."""
+    monkeypatch.setattr(
+        upload,
+        "upload",
+        lambda settings, dists: result_mod.UploadReport(
+            "url",
+            [
+                result_mod.FileUploadResult(
+                    "a.whl", "success", None, False, False, None
+                ),
+                result_mod.FileUploadResult(
+                    "b.whl", "failed", "err", False, False, None
+                ),
+            ],
+        ),
+    )
+
+    exit_code = upload.main(
+        ["--result-file", result_file, helpers.WHEEL_FIXTURE]
+    )
+    assert exit_code == 2
