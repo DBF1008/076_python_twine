@@ -34,6 +34,15 @@ def default_repo():
     )
 
 
+@pytest.fixture()
+def test_pypi_repo():
+    return repository.Repository(
+        repository_url=utils.TEST_REPOSITORY,
+        username="username",
+        password="password",
+    )
+
+
 def test_gpg_signature_structure_is_preserved():
     """Preserve 'gpg_signature' key when converting metadata."""
     data = {
@@ -347,6 +356,117 @@ def test_package_is_uploaded_incorrect_repo_url():
     repo.url = "https://bad.repo.com/legacy"
 
     assert repo.package_is_uploaded(None) is False
+
+
+def test_package_is_uploaded_testpypi_404s(test_pypi_repo):
+    """Return False when TestPyPI project API response status isn't 200."""
+    test_pypi_repo.session = pretend.stub(
+        get=lambda url, headers: response_with(status_code=404)
+    )
+    package = pretend.stub(safe_name="fake", version="2.12.0")
+
+    assert test_pypi_repo.package_is_uploaded(package) is False
+
+
+def test_package_is_uploaded_testpypi_with_releases(test_pypi_repo):
+    """Return True when package exists on TestPyPI."""
+    test_pypi_repo.session = pretend.stub(
+        get=lambda url, headers: response_with(
+            status_code=200,
+            _content=b'{"releases": {"0.1": [{"filename": "fake.whl"}]}}',
+            _content_consumed=True,
+        ),
+    )
+    package = pretend.stub(
+        safe_name="fake",
+        version="0.1",
+        basefilename="fake.whl",
+    )
+
+    assert test_pypi_repo.package_is_uploaded(package) is True
+
+
+def test_package_is_uploaded_queries_pypi_api(default_repo):
+    """PyPI repo queries the pypi.org JSON API, not legacy or TestPyPI."""
+    requested_urls = []
+
+    def fake_get(url, headers):
+        requested_urls.append(url)
+        return response_with(status_code=404)
+
+    default_repo.session = pretend.stub(get=fake_get)
+    package = pretend.stub(safe_name="fake", version="0.1")
+
+    default_repo.package_is_uploaded(package)
+
+    assert requested_urls == ["https://pypi.org/pypi/fake/json"]
+
+
+def test_package_is_uploaded_queries_testpypi_api(test_pypi_repo):
+    """TestPyPI repo queries the test.pypi.org JSON API, not pypi.org."""
+    requested_urls = []
+
+    def fake_get(url, headers):
+        requested_urls.append(url)
+        return response_with(status_code=404)
+
+    test_pypi_repo.session = pretend.stub(get=fake_get)
+    package = pretend.stub(safe_name="fake", version="0.1")
+
+    test_pypi_repo.package_is_uploaded(package)
+
+    assert requested_urls == ["https://test.pypi.org/pypi/fake/json"]
+
+
+def test_cache_isolation_between_pypi_and_testpypi():
+    """PyPI and TestPyPI Repository instances maintain independent caches."""
+    pypi_repo = repository.Repository(
+        repository_url=utils.DEFAULT_REPOSITORY,
+        username="u",
+        password="p",
+    )
+    testpypi_repo = repository.Repository(
+        repository_url=utils.TEST_REPOSITORY,
+        username="u",
+        password="p",
+    )
+
+    # Pre-populate PyPI cache: fake 0.1 exists
+    pypi_repo._releases_json_data = {
+        "fake": {"0.1": [{"filename": "fake.whl"}]}
+    }
+
+    # TestPyPI has no cache; its API says the package doesn't exist
+    testpypi_repo.session = pretend.stub(
+        get=lambda url, headers: response_with(status_code=404)
+    )
+
+    package = pretend.stub(
+        safe_name="fake", version="0.1", basefilename="fake.whl"
+    )
+
+    # PyPI says it's uploaded (from cache)
+    assert pypi_repo.package_is_uploaded(package) is True
+    # TestPyPI says it's NOT uploaded (independent lookup)
+    assert testpypi_repo.package_is_uploaded(package) is False
+
+
+def test_package_is_uploaded_private_repo_no_api_call():
+    """Private repos return False without making any API calls."""
+    repo = repository.Repository(
+        repository_url="https://private.example.com/simple/",
+        username="u",
+        password="p",
+    )
+    # If it tries to make a request, the test will fail
+    repo.session = pretend.stub(
+        get=pretend.raiser(AssertionError("Should not make any API calls"))
+    )
+    package = pretend.stub(
+        safe_name="fake", version="0.1", basefilename="fake.whl"
+    )
+
+    assert repo.package_is_uploaded(package) is False
 
 
 @pytest.mark.parametrize(
